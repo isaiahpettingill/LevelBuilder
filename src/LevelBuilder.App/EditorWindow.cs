@@ -12,7 +12,6 @@ using Google.Protobuf;
 using System.Security.Cryptography;
 using LevelBuilder.Core;
 using LevelBuilder.Core.Format;
-using IconPacks.Avalonia.Material;
 using SixLabors.ImageSharp;
 using Point = Avalonia.Point;
 
@@ -83,15 +82,15 @@ public sealed class EditorWindow : Window
             Action("Check updates…", () => _ = CheckUpdates())
         } };
         toolbar.Children.Add(new Menu { ItemsSource = new[] { projectMenu } });
-        void IconAction(PackIconMaterialKind icon, string tip, Action click)
+        void IconAction(string icon, string tip, Action click)
         {
-            var button = new Button { Content = new PackIconMaterial { Kind = icon, Width = 20, Height = 20 }, Width = 38, Height = 36 };
+            var button = new Button { Content = new PathIcon { Data = Geometry.Parse(MaterialIconData.Get(icon)), Width = 20, Height = 20 }, Width = 38, Height = 36 };
             ToolTip.SetTip(button, tip);
             button.Click += (_, _) => click(); toolbar.Children.Add(button);
         }
-        IconAction(PackIconMaterialKind.ContentSave, "Save (Ctrl+S)", () => _ = Save());
-        IconAction(PackIconMaterialKind.Undo, "Undo (Ctrl+Z)", Undo);
-        IconAction(PackIconMaterialKind.Redo, "Redo (Ctrl+Y)", Redo);
+        IconAction("ContentSave", "Save (Ctrl+S)", () => _ = Save());
+        IconAction("Undo", "Undo (Ctrl+Z)", Undo);
+        IconAction("Redo", "Redo (Ctrl+Y)", Redo);
         toolbar.Children.Add(new TextBlock { Text = "Level", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) });
         toolbar.Children.Add(levelSelector);
         levelSelector.SelectionChanged += (_, _) => SwitchLevel(levelSelector.SelectedIndex);
@@ -100,13 +99,11 @@ public sealed class EditorWindow : Window
         toolbar.Children.Add(mode);
         var toolRail = new StackPanel { Spacing = 3, Margin = new Thickness(5) };
         var toolButtons = new List<ToggleButton>();
-        var icons = new[] { PackIconMaterialKind.Pencil, PackIconMaterialKind.Eraser, PackIconMaterialKind.VectorRectangle,
-            PackIconMaterialKind.FormatColorFill, PackIconMaterialKind.Eyedropper, PackIconMaterialKind.CursorDefault,
-            PackIconMaterialKind.Image, PackIconMaterialKind.MapMarker };
+        var icons = new[] { "Pencil", "Eraser", "VectorRectangle", "FormatColorFill", "Eyedropper", "CursorDefault", "Image", "MapMarker" };
         foreach (var tool in Enum.GetValues<EditorTool>())
         {
             var selectedTool = tool;
-            var button = new ToggleButton { Content = new PackIconMaterial { Kind = icons[(int)tool], Width = 21, Height = 21 },
+            var button = new ToggleButton { Content = new PathIcon { Data = Geometry.Parse(MaterialIconData.Get(icons[(int)tool])), Width = 21, Height = 21 },
                 Width = 42, Height = 40, IsChecked = tool == EditorTool.Pencil };
             ToolTip.SetTip(button, tool.ToString());
             button.Click += (_, _) =>

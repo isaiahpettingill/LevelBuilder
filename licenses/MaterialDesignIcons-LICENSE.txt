@@ -1,0 +1,13 @@
+Pictogrammers Free License
+--------------------------
+
+This icon collection is released as free, open source, and GPL friendly by
+the Pictogrammers icon group (https://pictogrammers.com/).
+
+Icons: Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+Some icons are redistributed under the Apache 2.0 license. All other icons
+are either redistributed under their respective licenses or are distributed
+under the Apache 2.0 license.
+
+Code: MIT (https://opensource.org/licenses/MIT)
+The MIT license applies to non-font and non-icon files.
