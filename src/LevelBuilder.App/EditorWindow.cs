@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
@@ -8,8 +9,10 @@ using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Google.Protobuf;
+using System.Security.Cryptography;
 using LevelBuilder.Core;
 using LevelBuilder.Core.Format;
+using IconPacks.Avalonia.Material;
 using SixLabors.ImageSharp;
 using Point = Avalonia.Point;
 
@@ -35,6 +38,9 @@ public sealed class EditorWindow : Window
     private readonly Dictionary<string, AseAsset> assets = [];
     private readonly Dictionary<(string path, int frame), Bitmap> bitmaps = [];
     private FileSystemWatcher? watcher;
+    private readonly Dictionary<string, int> queuedSourceChanges = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> sourceHashes = new(StringComparer.Ordinal);
+    private int watcherGeneration;
     private readonly Stack<Level> undo = new();
     private readonly Stack<Level> redo = new();
     private readonly CanvasView canvas;
@@ -62,21 +68,56 @@ public sealed class EditorWindow : Window
         level = document.Levels[0];
         Title = "LevelBuilder"; Width = 1380; Height = 850; MinWidth = 850; MinHeight = 550;
         canvas = new CanvasView(this) { Focusable = true, ClipToBounds = true };
-        var menu = new WrapPanel { Margin = new Thickness(6) };
-        void Button(string name, Action click) { var b = new Button { Content = name, Margin = new Thickness(2) }; b.Click += (_, _) => click(); menu.Children.Add(b); }
-        Button("New project", () => _ = NewProject()); Button("Open project", () => _ = OpenProject()); Button("Import asset", () => _ = Import());
-        Button("Add level", AddLevel); Button("Remove level", RemoveLevel); Button("Open .level/.levelz", () => _ = OpenLevel()); Button("Save", () => _ = Save()); Button("Save as", () => _ = Save(true));
-        menu.Children.Add(levelSelector);
+        var toolbar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Margin = new Thickness(6) };
+        MenuItem Action(string name, Action click)
+        {
+            var item = new MenuItem { Header = name }; item.Click += (_, _) => click(); return item;
+        }
+        var projectMenu = new MenuItem { Header = "☰  Project", ItemsSource = new[]
+        {
+            Action("New project…", () => _ = NewProject()), Action("Open .level / .levelz…", () => _ = OpenLevel()),
+            Action("Import asset…", () => _ = Import()), Action("Save as…", () => _ = Save(true)),
+            Action("Add level", AddLevel), Action("Remove level", RemoveLevel),
+            Action("Level settings…", () => _ = LevelSettings()), Action("Export game assets…", () => _ = Export()),
+            Action("Share .levelz…", () => _ = ExportBundle()), Action("Debug JSON…", () => _ = DebugJson()),
+            Action("Check updates…", () => _ = CheckUpdates())
+        } };
+        toolbar.Children.Add(new Menu { ItemsSource = new[] { projectMenu } });
+        void IconAction(PackIconMaterialKind icon, string tip, Action click)
+        {
+            var button = new Button { Content = new PackIconMaterial { Kind = icon, Width = 20, Height = 20 }, Width = 38, Height = 36 };
+            ToolTip.SetTip(button, tip);
+            button.Click += (_, _) => click(); toolbar.Children.Add(button);
+        }
+        IconAction(PackIconMaterialKind.ContentSave, "Save (Ctrl+S)", () => _ = Save());
+        IconAction(PackIconMaterialKind.Undo, "Undo (Ctrl+Z)", Undo);
+        IconAction(PackIconMaterialKind.Redo, "Redo (Ctrl+Y)", Redo);
+        toolbar.Children.Add(new TextBlock { Text = "Level", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) });
+        toolbar.Children.Add(levelSelector);
         levelSelector.SelectionChanged += (_, _) => SwitchLevel(levelSelector.SelectedIndex);
-        Button("Level settings", () => _ = LevelSettings());
-        Button("Undo", Undo); Button("Redo", Redo); Button("Export", () => _ = Export()); Button("Check updates", () => _ = CheckUpdates());
-        Button("Share .levelz", () => _ = ExportBundle());
-        Button("Debug JSON", () => _ = DebugJson());
         mode.ItemsSource = new[] { "Visual", "Collider", "Sprite", "Anchor" }; mode.SelectedIndex = 0; mode.SelectionChanged += (_, _) => canvas.InvalidateVisual();
         collider.SelectionChanged += (_, _) => canvas.InvalidateVisual();
-        menu.Children.Add(mode);
-        foreach (var tool in Enum.GetValues<EditorTool>()) Button(tool.ToString(), () => { canvas.Tool = tool; SetStatus($"Tool: {tool}"); canvas.Focus(); });
-        menu.Children.Add(grid); menu.Children.Add(snap); menu.Children.Add(random);
+        toolbar.Children.Add(mode);
+        var toolRail = new StackPanel { Spacing = 3, Margin = new Thickness(5) };
+        var toolButtons = new List<ToggleButton>();
+        var icons = new[] { PackIconMaterialKind.Pencil, PackIconMaterialKind.Eraser, PackIconMaterialKind.VectorRectangle,
+            PackIconMaterialKind.FormatColorFill, PackIconMaterialKind.Eyedropper, PackIconMaterialKind.CursorDefault,
+            PackIconMaterialKind.Image, PackIconMaterialKind.MapMarker };
+        foreach (var tool in Enum.GetValues<EditorTool>())
+        {
+            var selectedTool = tool;
+            var button = new ToggleButton { Content = new PackIconMaterial { Kind = icons[(int)tool], Width = 21, Height = 21 },
+                Width = 42, Height = 40, IsChecked = tool == EditorTool.Pencil };
+            ToolTip.SetTip(button, tool.ToString());
+            button.Click += (_, _) =>
+            {
+                foreach (var other in toolButtons) other.IsChecked = other == button;
+                canvas.Tool = selectedTool; SetStatus($"Tool: {selectedTool}"); canvas.Focus();
+            };
+            toolButtons.Add(button); toolRail.Children.Add(button);
+        }
+        toolRail.Children.Add(new Separator());
+        toolRail.Children.Add(grid); toolRail.Children.Add(snap); toolRail.Children.Add(random);
         grid.Click += (_, _) => canvas.InvalidateVisual();
         var left = new Grid { RowDefinitions = new RowDefinitions("Auto,*,Auto,*"), Width = 270 };
         left.Children.Add(new TextBlock { Text = "Tileset palette", FontWeight = FontWeight.Bold, Margin = new Thickness(8) });
@@ -96,15 +137,17 @@ public sealed class EditorWindow : Window
         var s = new StackPanel { Margin = new Thickness(8) }; s.Children.Add(new TextBlock { Text = "Sprite / animation" }); s.Children.Add(sprites); s.Children.Add(animation);
         Grid.SetRow(s, 3); right.Children.Add(s); sprites.SelectionChanged += (_, _) => RefreshAnimations();
         var scroll = new ScrollViewer { Content = properties }; Grid.SetRow(scroll, 4); right.Children.Add(scroll);
-        var main = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto") };
-        main.Children.Add(left); Grid.SetColumn(canvas, 1); main.Children.Add(canvas); Grid.SetColumn(right, 2); main.Children.Add(right);
+        var main = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,Auto,*,Auto") };
+        main.Children.Add(left); Grid.SetColumn(toolRail, 1); main.Children.Add(toolRail);
+        Grid.SetColumn(canvas, 2); main.Children.Add(canvas); Grid.SetColumn(right, 3); main.Children.Add(right);
         var root = new Grid { RowDefinitions = new RowDefinitions("Auto,*,Auto") };
-        root.Children.Add(menu); Grid.SetRow(main, 1); root.Children.Add(main);
+        root.Children.Add(toolbar); Grid.SetRow(main, 1); root.Children.Add(main);
         var bar = new DockPanel { Margin = new Thickness(6) }; bar.Children.Add(status); Grid.SetRow(bar, 2); root.Children.Add(bar);
         Content = root;
         RefreshLevels(); RefreshLayers(); RefreshEnums(); SetStatus("Create or open a project to begin.");
         KeyDown += OnKeyDown;
         Closing += (_, e) => { if (dirty) { e.Cancel = true; _ = ConfirmClose(); } };
+        Closed += (_, _) => { watcherGeneration++; watcher?.Dispose(); bundleWorkspace?.Dispose(); ClearAssets(); };
         animationTimer.Tick += (_, _) => canvas.InvalidateVisual(); animationTimer.Start();
         recoveryTimer.Tick += (_, _) => { if (dirty && levelPath is not null) { SyncDocument(); LevelStore.SaveDocument(document, levelPath + ".recovery"); } }; recoveryTimer.Start();
         Opened += (_, _) => _ = CheckUpdates(silent: true);
@@ -197,64 +240,104 @@ public sealed class EditorWindow : Window
     private async Task NewProject()
     {
         if (!await ConfirmDiscard()) return;
-        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = "New project", SuggestedFileName = "levelbuilder.json", FileTypeChoices = [new FilePickerFileType("Project JSON") { Patterns = ["*.json"] }] });
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = "New project", SuggestedFileName = "game.level", FileTypeChoices = [new FilePickerFileType("Level project") { Patterns = ["*.level"] }] });
         if (file is null) return;
-        var path = file.Path.LocalPath; await LoadProject(path, ProjectConfig.Create(path));
-    }
-    private async Task OpenProject()
-    {
-        if (!await ConfirmDiscard()) return;
-        var file = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { Title = "Open project", AllowMultiple = false, FileTypeFilter = [new FilePickerFileType("Project JSON") { Patterns = ["*.json"] }] });
-        if (file.Count == 0) return;
-        try { await LoadProject(file[0].Path.LocalPath, ProjectConfig.Load(file[0].Path.LocalPath)); } catch (Exception e) { await Error(e.Message); }
+        try
+        {
+            var path = Path.ChangeExtension(file.Path.LocalPath, ".level");
+            var config = new ProjectConfig();
+            await LoadProject(path, config);
+            levelPath = path;
+            SyncDocument(); LevelStore.SaveDocument(document, path); dirty = false; UpdateTitle();
+        }
+        catch (Exception e) { await Error(e.Message); }
     }
     private async Task LoadProject(string path, ProjectConfig config, string? selectedFile = null, BundleWorkspace? openedBundle = null)
     {
-        watcher?.Dispose(); ClearAssets(); bundleWorkspace?.Dispose(); bundleWorkspace = openedBundle;
+        watcherGeneration++; watcher?.Dispose(); queuedSourceChanges.Clear(); sourceHashes.Clear(); ClearAssets(); bundleWorkspace?.Dispose(); bundleWorkspace = openedBundle;
         bundlePath = null;
         var provisional = new ProjectContext(path, config);
         Directory.CreateDirectory(provisional.Resolve(config.LevelDirectory));
-        var first = selectedFile ?? Directory.EnumerateFiles(provisional.Resolve(config.LevelDirectory), "*.level", SearchOption.TopDirectoryOnly).FirstOrDefault();
-        if (first is not null) try { await LoadWithRecovery(first, config); } catch (Exception e) { await Error(e.Message); document = LevelStore.NewDocument(config); level = document.Levels[0]; levelPath = null; dirty = false; }
+        var first = selectedFile;
+        if (first is not null) await LoadWithRecovery(first, config);
         else { document = LevelStore.NewDocument(config); level = document.Levels[0]; levelPath = null; dirty = false; }
         project = new ProjectContext(path, ProjectConfig.FromSettings(document.Project));
         activeLevelIndex = 0; level = document.Levels[0];
         RefreshEnums(); ReloadAssets(); RefreshCache();
-        var directory = project.Resolve(project.Config.AssetDirectory); Directory.CreateDirectory(directory);
-        watcher = new FileSystemWatcher(directory) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName, EnableRaisingEvents = true };
-        watcher.Changed += AssetChanged; watcher.Created += AssetChanged; watcher.Renamed += (_, e) => AssetChanged(null, e);
-        watcher.Deleted += (_, e) => Dispatcher.UIThread.Post(() =>
+        Directory.CreateDirectory(project.Resolve(project.Config.AssetDirectory));
+        watcher = new FileSystemWatcher(project.Root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size };
+        watcher.Changed += AssetChanged; watcher.Created += AssetChanged; watcher.Deleted += AssetChanged;
+        watcher.Renamed += (_, e) => { QueueAssetChange(e.OldFullPath); QueueAssetChange(e.FullPath); };
+        watcher.Error += (_, _) => Dispatcher.UIThread.Post(() =>
         {
             if (project is null) return;
-            var path = project.Relative(e.FullPath);
-            if (!project.Config.Assets.ContainsKey(path)) return;
-            try { ReloadOne(path, project.Config.Assets[path]); }
-            catch { RestoreCached(path); }
-            RefreshPalette(); Validate();
+            foreach (var path in project.Config.Assets.Keys) ScheduleAssetChange(path);
         });
+        watcher.EnableRaisingEvents = true;
         undo.Clear(); redo.Clear(); RefreshLevels(); RefreshLayers(); RefreshPalette(); UpdateTitle(); Validate(); canvas.MarkDataDirty();
     }
-    private async void AssetChanged(object? sender, FileSystemEventArgs e)
+    private void AssetChanged(object? sender, FileSystemEventArgs e) => QueueAssetChange(e.FullPath);
+    private void QueueAssetChange(string fullPath)
     {
-        if (project is null || !e.FullPath.EndsWith(".ase", StringComparison.OrdinalIgnoreCase) && !e.FullPath.EndsWith(".aseprite", StringComparison.OrdinalIgnoreCase) && !e.FullPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) return;
-        var sourceProject = project;
-        await Task.Delay(300);
         Dispatcher.UIThread.Post(() =>
         {
-            if (project != sourceProject || !sourceProject.Config.Assets.ContainsKey(sourceProject.Relative(e.FullPath))) return;
-            var path = sourceProject.Relative(e.FullPath);
-            try { ReloadOne(path, sourceProject.Config.Assets[path]); RefreshCache(); Changed(); RefreshPalette(); Validate(); }
-            catch (Exception error) { SetStatus($"Asset {path}: {error.Message}"); }
+            if (project is null) return;
+            var path = project.Relative(fullPath);
+            if (project.Config.Assets.ContainsKey(path)) ScheduleAssetChange(path);
         });
+    }
+    private async void ScheduleAssetChange(string path)
+    {
+        if (project is null) return;
+        var currentProject = project;
+        var generation = watcherGeneration;
+        var serial = queuedSourceChanges.GetValueOrDefault(path) + 1;
+        queuedSourceChanges[path] = serial;
+        await Task.Delay(400);
+        if (project != currentProject || watcherGeneration != generation || queuedSourceChanges.GetValueOrDefault(path) != serial) return;
+        if (!currentProject.Config.Assets.TryGetValue(path, out var kind)) return;
+        var full = currentProject.Resolve(path);
+        if (!File.Exists(full))
+        {
+            sourceHashes.Remove(path);
+            if (!assets.ContainsKey(path)) try { RestoreCached(path); RefreshPalette(); } catch (Exception error) { SetStatus($"Asset {path}: {error.Message}"); return; }
+            SetStatus($"Source missing: {path}; using embedded cache.");
+            return;
+        }
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            try
+            {
+                var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(full)));
+                if (sourceHashes.GetValueOrDefault(path) == hash && assets.ContainsKey(path)) return;
+                var parsed = ReadAsset(path, kind);
+                CachedAsset cached;
+                try { if (kind == AssetKind.Tileset) parsed.ValidateTileset(); cached = AssetCache.Create(path, kind, parsed); }
+                catch { parsed.Dispose(); throw; }
+                UseAsset(path, kind, parsed);
+                AssetCache.Replace(document, cached);
+                sourceHashes[path] = hash;
+                Changed(); RefreshPalette(); Validate();
+                var issues = LevelValidator.ValidateDocument(document, currentProject, assets);
+                SetStatus(issues.Count == 0 ? $"Reloaded {path}; embedded cache updated." : $"Reloaded {path}; {issues.Count} validation issue(s): {issues[0]}");
+                return;
+            }
+            catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
+            {
+                if (attempt == 3) { SetStatus($"Asset {path}: {error.Message}; previous cache retained."); return; }
+                await Task.Delay(200 * (attempt + 1));
+                if (project != currentProject || watcherGeneration != generation || queuedSourceChanges.GetValueOrDefault(path) != serial) return;
+            }
+        }
     }
     private void ClearAssets() { foreach (var item in assets.Values) item.Dispose(); assets.Clear(); foreach (var image in bitmaps.Values) image.Dispose(); bitmaps.Clear(); }
     private void ReloadAssets()
     {
         if (project is null) return;
-        ClearAssets();
+        ClearAssets(); sourceHashes.Clear();
         foreach (var (path, kind) in project.Config.Assets)
         {
-            try { ReloadOne(path, kind); }
+            try { ReloadOne(path, kind); sourceHashes[path] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(project.Resolve(path)))); }
             catch (Exception e) { try { RestoreCached(path); SetStatus($"Using cached asset {path}: {e.Message}"); } catch { SetStatus($"Asset {path}: {e.Message}"); } }
         }
         canvas.InvalidateVisual();
@@ -262,13 +345,18 @@ public sealed class EditorWindow : Window
     private void ReloadOne(string path, AssetKind kind)
     {
         if (project is null) return;
+        UseAsset(path, kind, ReadAsset(path, kind));
+    }
+    private AseAsset ReadAsset(string path, AssetKind kind)
+    {
+        if (project is null) throw new InvalidOperationException("Open a project first.");
         var full = project.Resolve(path);
         var cached = document.CachedAssets.FirstOrDefault(c => c.Path == path);
         var parsed = path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
             ? PngAssetReader.Read(full, kind, kind == AssetKind.Tileset ? (int)(cached?.FrameWidth ?? level.TileWidth) : 0,
                 kind == AssetKind.Tileset ? (int)(cached?.FrameHeight ?? level.TileHeight) : 0)
             : AsepriteReader.Read(full);
-        UseAsset(path, kind, parsed);
+        return parsed;
     }
     private void RestoreCached(string path)
     {
@@ -328,7 +416,7 @@ public sealed class EditorWindow : Window
             }
             catch (Exception e) { await Error($"{file.Name}: {e.Message}"); }
         }
-        project.Config.Save(project.PathName); ReloadAssets(); RefreshCache(); RefreshPalette(); Changed(); Validate();
+        ReloadAssets(); RefreshCache(); RefreshPalette(); Changed(); Validate();
     }
     private void AddLevel()
     {
@@ -360,14 +448,19 @@ public sealed class EditorWindow : Window
         level.TileWidth = uint.Parse(fields[3].Text!); level.TileHeight = uint.Parse(fields[4].Text!);
         Changed(); RefreshLevels(); Validate();
     }
-    private async Task OpenLevel()
+    public void OpenFile(string path) => _ = OpenLevel(path);
+    private async Task OpenLevel(string? chosenPath = null)
     {
         if (!await ConfirmDiscard()) return;
-        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { AllowMultiple = false, Title = "Open project", FileTypeFilter = [new FilePickerFileType("Level project or bundle") { Patterns = ["*.level", "*.levelz"] }] });
-        if (files.Count == 0) return;
+        if (chosenPath is null)
+        {
+            var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { AllowMultiple = false, Title = "Open project", FileTypeFilter = [new FilePickerFileType("Level project or bundle") { Patterns = ["*.level", "*.levelz"] }] });
+            if (files.Count == 0) return;
+            chosenPath = files[0].Path.LocalPath;
+        }
         try
         {
-            var path = files[0].Path.LocalPath;
+            var path = chosenPath;
             if (path.EndsWith(".levelz", StringComparison.OrdinalIgnoreCase))
             {
                 var opened = LevelBundle.Open(path);
@@ -376,9 +469,8 @@ public sealed class EditorWindow : Window
             }
             else
             {
-                var config = project?.Config ?? ProjectConfig.FromSettings(LevelStore.LoadDocument(path).Project);
-                var configPath = project?.PathName ?? Path.Combine(Path.GetDirectoryName(path)!, "project.json");
-                await LoadProject(configPath, config, path);
+                var config = ProjectConfig.FromSettings(LevelStore.LoadDocument(path).Project);
+                await LoadProject(path, config, path);
             }
             selected = null; UpdateTitle(); Validate();
         }

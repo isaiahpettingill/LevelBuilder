@@ -18,6 +18,9 @@ public sealed class App : Application
         {
             var window = new EditorWindow();
             desktop.MainWindow = window;
+            var requestedFile = desktop.Args?.FirstOrDefault(arg =>
+                arg.EndsWith(".level", StringComparison.OrdinalIgnoreCase) || arg.EndsWith(".levelz", StringComparison.OrdinalIgnoreCase));
+            if (requestedFile is not null) window.Opened += (_, _) => window.OpenFile(requestedFile);
             if (desktop.Args?.Contains("--smoke-test") == true)
                 window.Opened += (_, _) => Dispatcher.UIThread.Post(() => { Console.WriteLine("LevelBuilder startup OK"); desktop.Shutdown(); }, DispatcherPriority.Background);
         }

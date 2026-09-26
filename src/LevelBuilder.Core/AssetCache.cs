@@ -28,6 +28,12 @@ public static class PngAssetReader
 
 public static class AssetCache
 {
+    public static void Replace(LevelDocument document, CachedAsset replacement)
+    {
+        for (var i = document.CachedAssets.Count - 1; i >= 0; i--)
+            if (document.CachedAssets[i].Path == replacement.Path) document.CachedAssets.RemoveAt(i);
+        document.CachedAssets.Add(replacement);
+    }
     public static CachedAsset Create(string path, AssetKind kind, AseAsset asset)
     {
         using var atlas = new Image<Rgba32>(checked(asset.Width * asset.Frames.Count), asset.Height);

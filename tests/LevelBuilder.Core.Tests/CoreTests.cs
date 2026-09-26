@@ -142,4 +142,32 @@ public class CoreTests
         }
         finally { Directory.Delete(root, true); }
     }
+    [Fact]
+    public void RefreshingOneSourceUpdatesItsEmbeddedAtlasWithoutChangingLevelReferences()
+    {
+        var root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        try
+        {
+            var source = Path.Combine(root, "tiles.png");
+            var doc = LevelStore.NewDocument(new ProjectConfig());
+            doc.Levels[0].VisualLayers[0].Tiles.Add(new TileCell { X = 2, Y = 4,
+                Tile = new TileReference { Tileset = "tiles.png", Tagged = new TaggedVariant { Tag = "tiles", Variant = 0 } } });
+            using (var image = new Image<Rgba32>(1, 1)) { image[0, 0] = new Rgba32(255, 0, 0); image.SaveAsPng(source); }
+            using (var old = PngAssetReader.Read(source, AssetKind.Tileset, 1, 1))
+            {
+                AssetCache.Replace(doc, AssetCache.Create("tiles.png", AssetKind.Tileset, old));
+                AssetCache.Replace(doc, AssetCache.Create("other.png", AssetKind.Tileset, old));
+            }
+            var otherBytes = doc.CachedAssets.Single(c => c.Path == "other.png").AtlasPng;
+            using (var image = new Image<Rgba32>(1, 1)) { image[0, 0] = new Rgba32(0, 255, 0); image.SaveAsPng(source); }
+            using (var updated = PngAssetReader.Read(source, AssetKind.Tileset, 1, 1))
+                AssetCache.Replace(doc, AssetCache.Create("tiles.png", AssetKind.Tileset, updated));
+            Assert.Equal(2, doc.CachedAssets.Count);
+            Assert.Equal(otherBytes, doc.CachedAssets.Single(c => c.Path == "other.png").AtlasPng);
+            using var restored = AssetCache.Restore(doc.CachedAssets.Single(c => c.Path == "tiles.png"));
+            Assert.Equal((byte)255, restored.Frames[0].Image[0, 0].G);
+            Assert.Equal("tiles", doc.Levels[0].VisualLayers[0].Tiles[0].Tile.Tagged.Tag);
+        }
+        finally { Directory.Delete(root, true); }
+    }
 }
