@@ -50,7 +50,7 @@ jobs:
             LevelBuilder-${{ matrix.rid }}.zip
             LevelBuilder-${{ matrix.rid }}.zip.sha256
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -60,8 +60,29 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: release
+      - name: Determine release version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            version="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' src/LevelBuilder.App/LevelBuilder.App.csproj | head -1)"
+            tag="v$version"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
+        if: steps.version.outputs.publish == 'true'
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             release/*
