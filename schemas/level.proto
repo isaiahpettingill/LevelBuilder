@@ -1,0 +1,56 @@
+syntax = "proto3";
+package levelbuilder;
+option csharp_namespace = "LevelBuilder.Core.Format";
+
+message Level {
+  uint32 format_version = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 tile_width = 5;
+  uint32 tile_height = 6;
+  repeated TileLayer visual_layers = 7;
+  repeated ColliderCell colliders = 8;
+  repeated SpriteObject sprites = 9;
+  repeated EntityAnchor anchors = 10;
+  repeated string tilesets = 11;
+}
+message TileLayer {
+  string name = 1;
+  bool visible = 2;
+  bool locked = 3;
+  repeated TileCell tiles = 4;
+}
+message TileCell {
+  int32 x = 1;
+  int32 y = 2;
+  TileReference tile = 3;
+}
+message TileReference {
+  string tileset = 1;
+  oneof identity {
+    TaggedVariant tagged = 2;
+    uint32 unstable_frame = 3;
+  }
+}
+message TaggedVariant { string tag = 1; uint32 variant = 2; }
+message ColliderCell { int32 x = 1; int32 y = 2; uint32 property = 3; }
+message SpriteObject {
+  string id = 1;
+  string asset = 2;
+  float x = 3;
+  float y = 4;
+  string animation = 5;
+  uint32 frame = 6;
+  bool loop = 7;
+  int32 draw_order = 8;
+  bool flip_x = 9;
+  bool flip_y = 10;
+}
+message EntityAnchor {
+  string id = 1;
+  string name = 2;
+  uint32 type = 3;
+  float x = 4;
+  float y = 5;
+}

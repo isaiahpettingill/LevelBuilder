@@ -1,0 +1,107 @@
+using System.Text;
+using LevelBuilder.Core;
+using LevelBuilder.Core.Format;
+using Xunit;
+
+namespace LevelBuilder.Core.Tests;
+
+public class CoreTests
+{
+    [Fact]
+    public void ProtobufRoundTripAndValidationPreserveTagRelativeReference()
+    {
+        var root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        try
+        {
+            var config = ProjectConfig.Create(Path.Combine(root, "project.json"));
+            var level = LevelStore.New("test", 8, 8, 1, 1);
+            level.VisualLayers[0].Tiles.Add(new TileCell { X = 2, Y = 3, Tile = new TileReference { Tileset = "assets/test.ase", Tagged = new TaggedVariant { Tag = "grass", Variant = 1 } } });
+            config.Assets["assets/test.ase"] = AssetKind.Tileset;
+            var path = Path.Combine(root, "levels", "test.level"); LevelStore.Save(level, path);
+            var loaded = LevelStore.Load(path);
+            Assert.Equal("grass", loaded.VisualLayers[0].Tiles[0].Tile.Tagged.Tag);
+            Assert.Equal((uint)1, loaded.VisualLayers[0].Tiles[0].Tile.Tagged.Variant);
+            Assert.Contains(LevelValidator.Validate(loaded, new ProjectContext(Path.Combine(root, "project.json"), config), new Dictionary<string, AseAsset>()), i => i.Message.Contains("Missing asset file"));
+        }
+        finally { Directory.Delete(root, true); }
+    }
+    [Fact]
+    public void GoEnumsAreDeterministicAndRejectDuplicates()
+    {
+        var config = new ProjectConfig();
+        var a = GoGenerator.Generate(config); Assert.Equal(a, GoGenerator.Generate(config));
+        Assert.Contains("ColliderTypeSpikes ColliderType = 2", a);
+        config.AnchorTypes.Add("PlayerSpawn");
+        Assert.Throws<InvalidDataException>(() => GoGenerator.Generate(config));
+    }
+    [Fact]
+    public void AsepriteTagsMapStableVariantsAndDetectOverlap()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".ase");
+        try
+        {
+            using (var bytes = new MemoryStream()) using (var w = new BinaryWriter(bytes, Encoding.UTF8, true))
+            {
+                w.Write(new byte[128]);
+                for (var i = 0; i < 3; i++)
+                {
+                    var start = bytes.Position; w.Write((uint)0); w.Write((ushort)0xF1FA); w.Write((ushort)(i == 0 ? 1 : 0)); w.Write((ushort)80); w.Write((ushort)0); w.Write((uint)0);
+                    if (i == 0)
+                    {
+                        var chunk = bytes.Position; w.Write((uint)0); w.Write((ushort)0x2018); w.Write((ushort)1); w.Write(new byte[8]);
+                        w.Write((ushort)0); w.Write((ushort)1); w.Write((byte)0); w.Write((ushort)0); w.Write(new byte[6]); w.Write(new byte[4]);
+                        w.Write((ushort)5); w.Write(Encoding.UTF8.GetBytes("grass"));
+                        var end = bytes.Position; bytes.Position = chunk; w.Write((uint)(end - chunk)); bytes.Position = end;
+                    }
+                    var frameEnd = bytes.Position; bytes.Position = start; w.Write((uint)(frameEnd - start)); bytes.Position = frameEnd;
+                }
+                var length = bytes.Position; bytes.Position = 0;
+                w.Write((uint)length); w.Write((ushort)0xA5E0); w.Write((ushort)3); w.Write((ushort)1); w.Write((ushort)1); w.Write((ushort)32);
+                File.WriteAllBytes(path, bytes.ToArray());
+            }
+            using var asset = AsepriteReader.Read(path);
+            Assert.Equal(1, asset.FrameFor("grass", 1));
+            Assert.Null(asset.FrameFor("grass", 2));
+            Assert.Equal(new[] { 2 }, asset.Untagged());
+            asset.ValidateTileset();
+            asset.Tags.Add(new AseTag("overlap", 1, 2, 0));
+            Assert.Throws<InvalidDataException>(() => asset.ValidateTileset());
+        }
+        finally { File.Delete(path); }
+    }
+    [Fact]
+    public void AsepriteCompositesRawRgbaCel()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".aseprite");
+        try
+        {
+            using var bytes = new MemoryStream(); using var writer = new BinaryWriter(bytes, Encoding.UTF8, true);
+            writer.Write(new byte[128]);
+            var frameStart = bytes.Position;
+            writer.Write((uint)0); writer.Write((ushort)0xF1FA); writer.Write((ushort)2); writer.Write((ushort)120); writer.Write((ushort)0); writer.Write((uint)0);
+            WriteChunk(0x2004, w =>
+            {
+                w.Write((ushort)1); w.Write((ushort)0); w.Write((ushort)0); w.Write((ushort)1); w.Write((ushort)1);
+                w.Write((ushort)0); w.Write((byte)255); w.Write(new byte[3]); w.Write((ushort)4); w.Write(Encoding.UTF8.GetBytes("base"));
+            });
+            WriteChunk(0x2005, w =>
+            {
+                w.Write((ushort)0); w.Write((short)0); w.Write((short)0); w.Write((byte)255); w.Write((ushort)0); w.Write((short)0); w.Write(new byte[5]);
+                w.Write((ushort)1); w.Write((ushort)1); w.Write(new byte[] { 255, 20, 10, 255 });
+            });
+            var end = bytes.Position; bytes.Position = frameStart; writer.Write((uint)(end - frameStart));
+            bytes.Position = 0; writer.Write((uint)end); writer.Write((ushort)0xA5E0); writer.Write((ushort)1); writer.Write((ushort)1); writer.Write((ushort)1); writer.Write((ushort)32);
+            File.WriteAllBytes(path, bytes.ToArray());
+            using var asset = AsepriteReader.Read(path);
+            Assert.Equal((byte)255, asset.Frames[0].Image[0, 0].R);
+            Assert.Equal((byte)20, asset.Frames[0].Image[0, 0].G);
+            Assert.Equal(120, asset.Frames[0].DurationMs);
+            void WriteChunk(ushort type, Action<BinaryWriter> content)
+            {
+                var start = bytes.Position; writer.Write((uint)0); writer.Write(type); content(writer);
+                var finish = bytes.Position; bytes.Position = start; writer.Write((uint)(finish - start)); bytes.Position = finish;
+            }
+        }
+        finally { File.Delete(path); }
+    }
+}

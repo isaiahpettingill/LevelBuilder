@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.33.4" />
+    <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="all" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <Protobuf Include="../../schemas/level.proto" GrpcServices="None" Link="level.proto" />
+    <EmbeddedResource Include="../../schemas/level.proto" LogicalName="LevelBuilder.Core.level.proto" />
+  </ItemGroup>
+</Project>
