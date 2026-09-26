@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Threading;
 using Avalonia.Themes.Fluent;
 
 namespace LevelBuilder.App;
@@ -13,7 +14,13 @@ public sealed class App : Application
     public override void Initialize() => Styles.Add(new FluentTheme());
     public override void OnFrameworkInitializationCompleted()
     {
-        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop) desktop.MainWindow = new EditorWindow();
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            var window = new EditorWindow();
+            desktop.MainWindow = window;
+            if (desktop.Args?.Contains("--smoke-test") == true)
+                window.Opened += (_, _) => Dispatcher.UIThread.Post(() => { Console.WriteLine("LevelBuilder startup OK"); desktop.Shutdown(); }, DispatcherPriority.Background);
+        }
         base.OnFrameworkInitializationCompleted();
     }
 }

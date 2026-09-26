@@ -45,6 +45,14 @@ jobs:
         shell: bash
         run: |
           python -c "from pathlib import Path; p=Path('publish/LevelBuilder.App${{ runner.os == 'Windows' && '.exe' || '' }}'); assert p.exists(); assert not any(Path('publish').glob('hostfxr*')), 'Managed runtime found'; print('Native executable:',p.stat().st_size,'bytes')"
+      - name: Smoke test Linux desktop startup
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a timeout 15s publish/LevelBuilder.App --smoke-test
+      - name: Remove symbol files from release package
+        shell: bash
+        run: find publish -type f \( -name '*.pdb' -o -name '*.dbg' \) -delete
       - name: Archive
         shell: bash
         run: |
