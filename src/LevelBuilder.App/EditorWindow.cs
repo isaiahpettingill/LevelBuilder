@@ -26,8 +26,12 @@ public sealed record PaletteChoice(string Asset, string? Tag, int Variant, int F
 public sealed class EditorWindow : Window
 {
     private ProjectContext? project;
-    private Level level = LevelStore.New();
+    private LevelDocument document = LevelStore.NewDocument(new ProjectConfig());
+    private Level level;
+    private int activeLevelIndex;
     private string? levelPath;
+    private string? bundlePath;
+    private BundleWorkspace? bundleWorkspace;
     private readonly Dictionary<string, AseAsset> assets = [];
     private readonly Dictionary<(string path, int frame), Bitmap> bitmaps = [];
     private FileSystemWatcher? watcher;
@@ -39,6 +43,7 @@ public sealed class EditorWindow : Window
     private readonly StackPanel properties = new() { Spacing = 7, Margin = new Thickness(8) };
     private readonly TextBlock status = new();
     private readonly ComboBox mode = new();
+    private readonly ComboBox levelSelector = new() { MinWidth = 130 };
     private readonly ComboBox collider = new();
     private readonly ComboBox anchorType = new();
     private readonly ComboBox sprites = new();
@@ -54,14 +59,18 @@ public sealed class EditorWindow : Window
 
     public EditorWindow()
     {
+        level = document.Levels[0];
         Title = "LevelBuilder"; Width = 1380; Height = 850; MinWidth = 850; MinHeight = 550;
         canvas = new CanvasView(this) { Focusable = true, ClipToBounds = true };
         var menu = new WrapPanel { Margin = new Thickness(6) };
         void Button(string name, Action click) { var b = new Button { Content = name, Margin = new Thickness(2) }; b.Click += (_, _) => click(); menu.Children.Add(b); }
-        Button("New project", () => _ = NewProject()); Button("Open project", () => _ = OpenProject()); Button("Import Aseprite", () => _ = Import());
-        Button("New level", () => NewLevel()); Button("Open level", () => _ = OpenLevel()); Button("Save", () => _ = Save()); Button("Save as", () => _ = Save(true));
+        Button("New project", () => _ = NewProject()); Button("Open project", () => _ = OpenProject()); Button("Import asset", () => _ = Import());
+        Button("Add level", AddLevel); Button("Remove level", RemoveLevel); Button("Open .level/.levelz", () => _ = OpenLevel()); Button("Save", () => _ = Save()); Button("Save as", () => _ = Save(true));
+        menu.Children.Add(levelSelector);
+        levelSelector.SelectionChanged += (_, _) => SwitchLevel(levelSelector.SelectedIndex);
         Button("Level settings", () => _ = LevelSettings());
         Button("Undo", Undo); Button("Redo", Redo); Button("Export", () => _ = Export()); Button("Check updates", () => _ = CheckUpdates());
+        Button("Share .levelz", () => _ = ExportBundle());
         Button("Debug JSON", () => _ = DebugJson());
         mode.ItemsSource = new[] { "Visual", "Collider", "Sprite", "Anchor" }; mode.SelectedIndex = 0; mode.SelectionChanged += (_, _) => canvas.InvalidateVisual();
         collider.SelectionChanged += (_, _) => canvas.InvalidateVisual();
@@ -93,11 +102,11 @@ public sealed class EditorWindow : Window
         root.Children.Add(menu); Grid.SetRow(main, 1); root.Children.Add(main);
         var bar = new DockPanel { Margin = new Thickness(6) }; bar.Children.Add(status); Grid.SetRow(bar, 2); root.Children.Add(bar);
         Content = root;
-        RefreshLayers(); RefreshEnums(); SetStatus("Create or open a project to begin.");
+        RefreshLevels(); RefreshLayers(); RefreshEnums(); SetStatus("Create or open a project to begin.");
         KeyDown += OnKeyDown;
         Closing += (_, e) => { if (dirty) { e.Cancel = true; _ = ConfirmClose(); } };
         animationTimer.Tick += (_, _) => canvas.InvalidateVisual(); animationTimer.Start();
-        recoveryTimer.Tick += (_, _) => { if (dirty && levelPath is not null) LevelStore.Save(level, levelPath + ".recovery"); }; recoveryTimer.Start();
+        recoveryTimer.Tick += (_, _) => { if (dirty && levelPath is not null) { SyncDocument(); LevelStore.SaveDocument(document, levelPath + ".recovery"); } }; recoveryTimer.Start();
         Opened += (_, _) => _ = CheckUpdates(silent: true);
     }
     internal Level Level => level;
@@ -126,9 +135,24 @@ public sealed class EditorWindow : Window
     internal TileLayer? ActiveLayer => layers.SelectedIndex >= 0 && layers.SelectedIndex < level.VisualLayers.Count ? level.VisualLayers[layers.SelectedIndex] : null;
     internal object? Selected { get => selected; set { selected = value; ShowSelected(); canvas.InvalidateVisual(); } }
     internal void Commit() { undo.Push(level.Clone()); if (undo.Count > 100) { var oldestFirst = undo.Reverse().Skip(1).ToArray(); undo.Clear(); foreach (var item in oldestFirst) undo.Push(item); } redo.Clear(); }
-    internal void Changed() { dirty = true; UpdateTitle(); canvas.MarkDataDirty(); }
+    internal void Changed() { dirty = true; SyncDocument(); UpdateTitle(); canvas.MarkDataDirty(); }
     internal void SetStatus(string message) => status.Text = message;
-    private void UpdateTitle() => Title = $"LevelBuilder · {level.Name}{(dirty ? " *" : "")}";
+    private void UpdateTitle() => Title = $"LevelBuilder · {Path.GetFileName(bundlePath ?? levelPath ?? project?.PathName ?? "Untitled")} / {level.Name}{(dirty ? " *" : "")}";
+    private void SyncDocument()
+    {
+        document.Levels[activeLevelIndex] = level;
+        if (project is not null) document.Project = project.Config.ToSettings();
+    }
+    private void RefreshLevels()
+    {
+        levelSelector.ItemsSource = document.Levels.Select(l => l.Name).ToArray();
+        levelSelector.SelectedIndex = activeLevelIndex;
+    }
+    private void SwitchLevel(int index)
+    {
+        if (index < 0 || index >= document.Levels.Count || index == activeLevelIndex) return;
+        SyncDocument(); activeLevelIndex = index; level = document.Levels[index]; selected = null; undo.Clear(); redo.Clear(); RefreshLayers(); ShowLayerProperties(); UpdateTitle(); canvas.MarkDataDirty();
+    }
     private void Undo() { if (undo.Count == 0) return; redo.Push(level); level = undo.Pop(); selected = null; RefreshLayers(); Changed(); }
     private void Redo() { if (redo.Count == 0) return; undo.Push(level); level = redo.Pop(); selected = null; RefreshLayers(); Changed(); }
     private void RefreshEnums()
@@ -184,37 +208,42 @@ public sealed class EditorWindow : Window
         if (file.Count == 0) return;
         try { await LoadProject(file[0].Path.LocalPath, ProjectConfig.Load(file[0].Path.LocalPath)); } catch (Exception e) { await Error(e.Message); }
     }
-    private async Task LoadProject(string path, ProjectConfig config)
+    private async Task LoadProject(string path, ProjectConfig config, string? selectedFile = null, BundleWorkspace? openedBundle = null)
     {
-        watcher?.Dispose(); ClearAssets(); project = new ProjectContext(path, config);
-        RefreshEnums(); ReloadAssets();
-        var directory = project.Resolve(config.AssetDirectory); Directory.CreateDirectory(directory);
+        watcher?.Dispose(); ClearAssets(); bundleWorkspace?.Dispose(); bundleWorkspace = openedBundle;
+        bundlePath = null;
+        var provisional = new ProjectContext(path, config);
+        Directory.CreateDirectory(provisional.Resolve(config.LevelDirectory));
+        var first = selectedFile ?? Directory.EnumerateFiles(provisional.Resolve(config.LevelDirectory), "*.level", SearchOption.TopDirectoryOnly).FirstOrDefault();
+        if (first is not null) try { await LoadWithRecovery(first, config); } catch (Exception e) { await Error(e.Message); document = LevelStore.NewDocument(config); level = document.Levels[0]; levelPath = null; dirty = false; }
+        else { document = LevelStore.NewDocument(config); level = document.Levels[0]; levelPath = null; dirty = false; }
+        project = new ProjectContext(path, ProjectConfig.FromSettings(document.Project));
+        activeLevelIndex = 0; level = document.Levels[0];
+        RefreshEnums(); ReloadAssets(); RefreshCache();
+        var directory = project.Resolve(project.Config.AssetDirectory); Directory.CreateDirectory(directory);
         watcher = new FileSystemWatcher(directory) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName, EnableRaisingEvents = true };
         watcher.Changed += AssetChanged; watcher.Created += AssetChanged; watcher.Renamed += (_, e) => AssetChanged(null, e);
         watcher.Deleted += (_, e) => Dispatcher.UIThread.Post(() =>
         {
             if (project is null) return;
             var path = project.Relative(e.FullPath);
-            if (assets.Remove(path, out var old)) old.Dispose();
-            foreach (var key in bitmaps.Keys.Where(k => k.path == path).ToArray()) { bitmaps[key].Dispose(); bitmaps.Remove(key); }
+            if (!project.Config.Assets.ContainsKey(path)) return;
+            try { ReloadOne(path, project.Config.Assets[path]); }
+            catch { RestoreCached(path); }
             RefreshPalette(); Validate();
         });
-        Directory.CreateDirectory(project.Resolve(config.LevelDirectory));
-        var first = Directory.EnumerateFiles(project.Resolve(config.LevelDirectory), "*.level", SearchOption.TopDirectoryOnly).FirstOrDefault();
-        if (first is not null) try { await LoadWithRecovery(first); } catch (Exception e) { await Error(e.Message); }
-        else { level = LevelStore.New(); levelPath = null; dirty = false; }
-        undo.Clear(); redo.Clear(); RefreshLayers(); RefreshPalette(); UpdateTitle(); Validate(); canvas.MarkDataDirty();
+        undo.Clear(); redo.Clear(); RefreshLevels(); RefreshLayers(); RefreshPalette(); UpdateTitle(); Validate(); canvas.MarkDataDirty();
     }
     private async void AssetChanged(object? sender, FileSystemEventArgs e)
     {
-        if (project is null || !e.FullPath.EndsWith(".ase", StringComparison.OrdinalIgnoreCase) && !e.FullPath.EndsWith(".aseprite", StringComparison.OrdinalIgnoreCase)) return;
+        if (project is null || !e.FullPath.EndsWith(".ase", StringComparison.OrdinalIgnoreCase) && !e.FullPath.EndsWith(".aseprite", StringComparison.OrdinalIgnoreCase) && !e.FullPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) return;
         var sourceProject = project;
         await Task.Delay(300);
         Dispatcher.UIThread.Post(() =>
         {
             if (project != sourceProject || !sourceProject.Config.Assets.ContainsKey(sourceProject.Relative(e.FullPath))) return;
             var path = sourceProject.Relative(e.FullPath);
-            try { ReloadOne(path, sourceProject.Config.Assets[path]); RefreshPalette(); Validate(); }
+            try { ReloadOne(path, sourceProject.Config.Assets[path]); RefreshCache(); Changed(); RefreshPalette(); Validate(); }
             catch (Exception error) { SetStatus($"Asset {path}: {error.Message}"); }
         });
     }
@@ -226,14 +255,29 @@ public sealed class EditorWindow : Window
         foreach (var (path, kind) in project.Config.Assets)
         {
             try { ReloadOne(path, kind); }
-            catch (Exception e) { SetStatus($"Asset {path}: {e.Message}"); }
+            catch (Exception e) { try { RestoreCached(path); SetStatus($"Using cached asset {path}: {e.Message}"); } catch { SetStatus($"Asset {path}: {e.Message}"); } }
         }
         canvas.InvalidateVisual();
     }
     private void ReloadOne(string path, AssetKind kind)
     {
         if (project is null) return;
-        var parsed = AsepriteReader.Read(project.Resolve(path));
+        var full = project.Resolve(path);
+        var cached = document.CachedAssets.FirstOrDefault(c => c.Path == path);
+        var parsed = path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+            ? PngAssetReader.Read(full, kind, kind == AssetKind.Tileset ? (int)(cached?.FrameWidth ?? level.TileWidth) : 0,
+                kind == AssetKind.Tileset ? (int)(cached?.FrameHeight ?? level.TileHeight) : 0)
+            : AsepriteReader.Read(full);
+        UseAsset(path, kind, parsed);
+    }
+    private void RestoreCached(string path)
+    {
+        var cache = document.CachedAssets.FirstOrDefault(c => c.Path == path) ?? throw new InvalidDataException($"No cached asset for {path}");
+        if (!Enum.TryParse<AssetKind>(cache.Kind, out var kind)) throw new InvalidDataException($"Invalid cached asset kind: {cache.Kind}");
+        UseAsset(path, kind, AssetCache.Restore(cache));
+    }
+    private void UseAsset(string path, AssetKind kind, AseAsset parsed)
+    {
         try
         {
             if (kind == AssetKind.Tileset) parsed.ValidateTileset();
@@ -255,10 +299,17 @@ public sealed class EditorWindow : Window
         }
         catch { parsed.Dispose(); throw; }
     }
+    private void RefreshCache()
+    {
+        if (project is null) return;
+        document.CachedAssets.Clear();
+        foreach (var (path, kind) in project.Config.Assets)
+            if (assets.TryGetValue(path, out var asset)) document.CachedAssets.Add(AssetCache.Create(path, kind, asset));
+    }
     private async Task Import()
     {
         if (project is null) { await Error("Open a project first."); return; }
-        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { Title = "Import Aseprite", AllowMultiple = true, FileTypeFilter = [new FilePickerFileType("Aseprite") { Patterns = ["*.ase", "*.aseprite"] }] });
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { Title = "Import asset", AllowMultiple = true, FileTypeFilter = [new FilePickerFileType("Aseprite or PNG") { Patterns = ["*.ase", "*.aseprite", "*.png"] }] });
         if (files.Count == 0) return;
         var kind = await Ask("Import as", "Tileset", "Animated sprite"); if (kind is null) return;
         foreach (var file in files)
@@ -268,17 +319,30 @@ public sealed class EditorWindow : Window
                 var dest = Path.Combine(project.Resolve(project.Config.AssetDirectory), Path.GetFileName(file.Path.LocalPath));
                 if (Path.GetFullPath(dest) != Path.GetFullPath(file.Path.LocalPath)) File.Copy(file.Path.LocalPath, dest, true);
                 var relative = project.Relative(dest);
-                using var parsed = AsepriteReader.Read(dest);
+                var assetKind = kind == "Tileset" ? AssetKind.Tileset : AssetKind.AnimatedSprite;
+                using var parsed = dest.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+                    ? PngAssetReader.Read(dest, assetKind, (int)level.TileWidth, (int)level.TileHeight)
+                    : AsepriteReader.Read(dest);
                 if (kind == "Tileset") parsed.ValidateTileset();
-                project.Config.Assets[relative] = kind == "Tileset" ? AssetKind.Tileset : AssetKind.AnimatedSprite;
+                project.Config.Assets[relative] = assetKind;
             }
             catch (Exception e) { await Error($"{file.Name}: {e.Message}"); }
         }
-        project.Config.Save(project.PathName); ReloadAssets(); RefreshPalette(); Validate();
+        project.Config.Save(project.PathName); ReloadAssets(); RefreshCache(); RefreshPalette(); Changed(); Validate();
     }
-    private void NewLevel()
+    private void AddLevel()
     {
-        level = LevelStore.New(); levelPath = null; undo.Clear(); redo.Clear(); dirty = true; Selected = null; RefreshLayers(); UpdateTitle(); canvas.MarkDataDirty();
+        SyncDocument();
+        var n = 1; while (document.Levels.Any(l => l.Name == $"Level {n}")) n++;
+        document.Levels.Add(LevelStore.New($"Level {n}", (int)level.Width, (int)level.Height, (int)level.TileWidth, (int)level.TileHeight));
+        activeLevelIndex = document.Levels.Count - 1; level = document.Levels[activeLevelIndex]; selected = null; undo.Clear(); redo.Clear();
+        RefreshLevels(); RefreshLayers(); Changed();
+    }
+    private void RemoveLevel()
+    {
+        if (document.Levels.Count <= 1) { SetStatus("A project needs at least one level."); return; }
+        document.Levels.RemoveAt(activeLevelIndex); activeLevelIndex = Math.Min(activeLevelIndex, document.Levels.Count - 1);
+        level = document.Levels[activeLevelIndex]; selected = null; undo.Clear(); redo.Clear(); RefreshLevels(); RefreshLayers(); Changed();
     }
     private async Task LevelSettings()
     {
@@ -294,65 +358,108 @@ public sealed class EditorWindow : Window
         Commit(); level.Name = fields[0].Text ?? "";
         level.Width = uint.Parse(fields[1].Text!); level.Height = uint.Parse(fields[2].Text!);
         level.TileWidth = uint.Parse(fields[3].Text!); level.TileHeight = uint.Parse(fields[4].Text!);
-        Changed(); Validate();
+        Changed(); RefreshLevels(); Validate();
     }
     private async Task OpenLevel()
     {
         if (!await ConfirmDiscard()) return;
-        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { AllowMultiple = false, Title = "Open level", FileTypeFilter = [new FilePickerFileType("Protobuf level") { Patterns = ["*.level"] }] });
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions { AllowMultiple = false, Title = "Open project", FileTypeFilter = [new FilePickerFileType("Level project or bundle") { Patterns = ["*.level", "*.levelz"] }] });
         if (files.Count == 0) return;
-        try { await LoadWithRecovery(files[0].Path.LocalPath); selected = null; undo.Clear(); redo.Clear(); RefreshLayers(); UpdateTitle(); Validate(); canvas.MarkDataDirty(); }
+        try
+        {
+            var path = files[0].Path.LocalPath;
+            if (path.EndsWith(".levelz", StringComparison.OrdinalIgnoreCase))
+            {
+                var opened = LevelBundle.Open(path);
+                await LoadProject(opened.Project.PathName, opened.Project.Config, opened.LevelPath, opened);
+                bundlePath = path;
+            }
+            else
+            {
+                var config = project?.Config ?? ProjectConfig.FromSettings(LevelStore.LoadDocument(path).Project);
+                var configPath = project?.PathName ?? Path.Combine(Path.GetDirectoryName(path)!, "project.json");
+                await LoadProject(configPath, config, path);
+            }
+            selected = null; UpdateTitle(); Validate();
+        }
         catch (Exception e) { await Error(e.Message); }
     }
-    private async Task LoadWithRecovery(string path)
+    private async Task LoadWithRecovery(string path, ProjectConfig config)
     {
         levelPath = path; dirty = false;
         var recovery = path + ".recovery";
         var recover = File.Exists(recovery) && File.GetLastWriteTimeUtc(recovery) > File.GetLastWriteTimeUtc(path)
             && await Ask("A newer recovery file exists. Open recovered changes?", "Recover", "Original") == "Recover";
-        level = LevelStore.Load(recover ? recovery : path);
+        document = LevelStore.LoadDocument(recover ? recovery : path, config);
+        activeLevelIndex = 0; level = document.Levels[0];
         dirty = recover;
     }
     private async Task Save(bool asNew = false)
     {
         if (project is null) { await Error("Open a project first."); return; }
-        var issues = LevelValidator.Validate(level, project, assets);
+        SyncDocument(); RefreshCache();
+        var issues = LevelValidator.ValidateDocument(document, project, assets);
         if (issues.Count > 0) { await Error("Fix validation errors before saving:\n" + string.Join("\n", issues.Take(20))); return; }
-        var path = asNew ? null : levelPath;
+        var path = asNew ? null : bundlePath ?? levelPath;
         if (path is null)
         {
-            var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = "Save level", SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(project.Resolve(project.Config.LevelDirectory)), SuggestedFileName = "level.level", FileTypeChoices = [new FilePickerFileType("Protobuf level") { Patterns = ["*.level"] }] });
+            var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = "Save project", SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(project.Resolve(project.Config.LevelDirectory)), SuggestedFileName = "game.level", FileTypeChoices = [new FilePickerFileType("Protobuf level") { Patterns = ["*.level"] }, new FilePickerFileType("Shareable bundle") { Patterns = ["*.levelz"] }] });
             if (file is null) return; path = file.Path.LocalPath;
         }
-        try { LevelStore.Save(level, path); levelPath = path; dirty = false; UpdateTitle(); if (File.Exists(path + ".recovery")) File.Delete(path + ".recovery"); SetStatus("Saved " + path); }
+        try
+        {
+            if (path.EndsWith(".levelz", StringComparison.OrdinalIgnoreCase))
+            {
+                if (bundleWorkspace is not null) LevelStore.SaveDocument(document, bundleWorkspace.LevelPath);
+                LevelBundle.Export(document, project, path);
+                bundlePath = path;
+            }
+            else { LevelStore.SaveDocument(document, path); levelPath = path; bundlePath = null; }
+            dirty = false; UpdateTitle();
+            if (levelPath is not null && File.Exists(levelPath + ".recovery")) File.Delete(levelPath + ".recovery");
+            SetStatus("Saved " + path);
+        }
         catch (Exception e) { await Error(e.Message); }
     }
     private async Task Export()
     {
         if (project is null) { await Error("Open a project first."); return; }
-        var issues = LevelValidator.Validate(level, project, assets);
+        SyncDocument(); RefreshCache();
+        var issues = LevelValidator.ValidateDocument(document, project, assets);
         if (issues.Count > 0) { await Error("Fix validation errors before export:\n" + string.Join("\n", issues.Take(20))); return; }
         try
         {
             var output = project.Resolve("build"); Directory.CreateDirectory(output);
             AssetExporter.Export(project, assets, Path.Combine(output, "assets"));
             File.WriteAllText(Path.Combine(output, "types.go"), GoGenerator.Generate(project.Config));
-            LevelStore.Save(level, Path.Combine(output, Path.GetFileName(levelPath ?? "level.level")));
+            LevelStore.SaveDocument(document, Path.Combine(output, "game.level"));
             SetStatus("Exported assets, Go types, and level to " + output);
         }
+        catch (Exception e) { await Error(e.Message); }
+    }
+    private async Task ExportBundle()
+    {
+        if (project is null) { await Error("Open a project first."); return; }
+        SyncDocument(); RefreshCache();
+        var issues = LevelValidator.ValidateDocument(document, project, assets);
+        if (issues.Count > 0) { await Error("Fix validation errors before sharing:\n" + string.Join("\n", issues.Take(20))); return; }
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = "Share project", SuggestedFileName = "game.levelz", FileTypeChoices = [new FilePickerFileType("Shareable level bundle") { Patterns = ["*.levelz"] }] });
+        if (file is null) return;
+        try { LevelBundle.Export(document, project, file.Path.LocalPath); SetStatus("Exported " + file.Path.LocalPath); }
         catch (Exception e) { await Error(e.Message); }
     }
     private async Task DebugJson()
     {
         var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { SuggestedFileName = "level.debug.json", FileTypeChoices = [new FilePickerFileType("JSON") { Patterns = ["*.json"] }] });
         if (file is null) return;
-        try { File.WriteAllText(file.Path.LocalPath, LevelStore.DebugJson(level)); SetStatus("Saved debug JSON"); }
+        try { SyncDocument(); File.WriteAllText(file.Path.LocalPath, LevelStore.DebugJson(document)); SetStatus("Saved debug JSON"); }
         catch (Exception e) { await Error(e.Message); }
     }
     private void Validate()
     {
         if (project is null) return;
-        var issues = LevelValidator.Validate(level, project, assets);
+        SyncDocument();
+        var issues = LevelValidator.ValidateDocument(document, project, assets);
         SetStatus(issues.Count == 0 ? "Level valid" : $"{issues.Count} validation issue(s): {issues[0]}");
     }
     private async Task CheckUpdates(bool silent = false)

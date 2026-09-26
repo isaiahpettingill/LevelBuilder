@@ -8,6 +8,43 @@ namespace LevelBuilder.Core;
 
 public static class LevelStore
 {
+    public static LevelDocument NewDocument(ProjectConfig config)
+    {
+        var document = new LevelDocument { FormatVersion = 1, Project = config.ToSettings() };
+        document.Levels.Add(New());
+        return document;
+    }
+    public static LevelDocument LoadDocument(string path, ProjectConfig? legacyProject = null)
+    {
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            var document = LevelDocument.Parser.ParseFrom(bytes);
+            if (document.FormatVersion == 1 && document.Project is not null && document.Levels.Count > 0)
+            {
+                ProjectConfig.FromSettings(document.Project);
+                return document;
+            }
+            if (document.FormatVersion != 0) throw new InvalidDataException($"Unsupported document format {document.FormatVersion}");
+            // Import version 0.1.0 files that contained one bare Level and used project.json.
+            if (legacyProject is null) throw new InvalidDataException("Legacy level needs its project configuration for import");
+            var old = Level.Parser.ParseFrom(bytes);
+            if (old.FormatVersion != 1) throw new InvalidDataException("Malformed or unsupported legacy level");
+            var imported = new LevelDocument { FormatVersion = 1, Project = legacyProject.ToSettings() };
+            imported.Levels.Add(old);
+            return imported;
+        }
+        catch (InvalidProtocolBufferException e) { throw new InvalidDataException($"Malformed protobuf: {e.Message}", e); }
+    }
+    public static void SaveDocument(LevelDocument document, string path)
+    {
+        if (document.FormatVersion != 1 || document.Project is null || document.Levels.Count == 0)
+            throw new InvalidDataException("Document needs a supported version, project settings, and at least one level");
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        var temp = path + ".tmp";
+        using (var file = File.Create(temp)) document.WriteTo(file);
+        File.Move(temp, path, true);
+    }
     public static Level New(string name = "New level", int width = 100, int height = 60, int tileWidth = 16, int tileHeight = 16)
     {
         var level = new Level { FormatVersion = 1, Name = name, Width = (uint)width, Height = (uint)height, TileWidth = (uint)tileWidth, TileHeight = (uint)tileHeight };
@@ -27,6 +64,7 @@ public static class LevelStore
         File.Move(temp, path, true);
     }
     public static string DebugJson(Level level) => JsonFormatter.Default.Format(level);
+    public static string DebugJson(LevelDocument document) => JsonFormatter.Default.Format(document);
 }
 
 public sealed record ValidationIssue(string Location, string Message)
@@ -35,6 +73,33 @@ public sealed record ValidationIssue(string Location, string Message)
 }
 public static class LevelValidator
 {
+    public static List<ValidationIssue> ValidateDocument(LevelDocument document, ProjectContext project, IReadOnlyDictionary<string, AseAsset> assets)
+    {
+        var issues = new List<ValidationIssue>();
+        if (document.FormatVersion != 1 || document.Project is null) { issues.Add(new ValidationIssue("Document", "Missing project settings or unsupported format")); return issues; }
+        ProjectConfig embedded;
+        try { embedded = ProjectConfig.FromSettings(document.Project); }
+        catch (InvalidDataException e) { issues.Add(new ValidationIssue("Document project", e.Message)); return issues; }
+        var cachedPaths = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var cached in document.CachedAssets)
+        {
+            if (!cachedPaths.Add(cached.Path)) issues.Add(new ValidationIssue("Asset cache", $"Duplicate cached asset {cached.Path}"));
+            if (!embedded.Assets.TryGetValue(cached.Path, out var expected) || expected.ToString() != cached.Kind)
+                issues.Add(new ValidationIssue("Asset cache", $"Unknown or mismatched cached asset {cached.Path}"));
+            if (cached.AtlasPng.IsEmpty || cached.DurationsMs.Count == 0) issues.Add(new ValidationIssue("Asset cache", $"Missing atlas or frames for {cached.Path}"));
+        }
+        foreach (var path in embedded.Assets.Keys)
+            if (!cachedPaths.Contains(path)) issues.Add(new ValidationIssue("Asset cache", $"Missing embedded texture for {path}"));
+        if (document.Levels.Count == 0) issues.Add(new ValidationIssue("Document", "At least one level is required"));
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var embeddedProject = new ProjectContext(project.PathName, embedded);
+        foreach (var level in document.Levels)
+        {
+            if (string.IsNullOrWhiteSpace(level.Name) || !names.Add(level.Name)) issues.Add(new ValidationIssue("Level", $"Duplicate or empty level name: {level.Name}"));
+            issues.AddRange(Validate(level, embeddedProject, assets).Select(i => new ValidationIssue($"{level.Name} / {i.Location}", i.Message)));
+        }
+        return issues;
+    }
     public static List<ValidationIssue> Validate(Level level, ProjectContext project, IReadOnlyDictionary<string, AseAsset> assets)
     {
         var issues = new List<ValidationIssue>();
@@ -144,8 +209,11 @@ public static class AssetExporter
                 for (var y = 0; y < asset.Height; y++) for (var x = 0; x < asset.Width; x++) atlas[i * asset.Width + x, y] = frame[x, y];
             }
             atlas.SaveAsPng(Path.Combine(destination, stem + ".png"));
-            var metadata = new { source = path, kind = kind.ToString(), frameWidth = asset.Width, frameHeight = asset.Height, durationsMs = asset.Frames.Select(f => f.DurationMs), tags = asset.Tags.Select(t => new { t.Name, t.From, t.To, t.Direction }), unstableFrames = asset.Untagged() };
-            File.WriteAllText(Path.Combine(destination, stem + ".json"), System.Text.Json.JsonSerializer.Serialize(metadata, ProjectConfig.JsonOptions));
+            var metadata = new AssetMetadata(path, kind.ToString(), asset.Width, asset.Height,
+                asset.Frames.Select(f => f.DurationMs).ToList(),
+                asset.Tags.Select(t => new AssetTagMetadata(t.Name, t.From, t.To, t.Direction)).ToList(),
+                asset.Untagged().ToList());
+            File.WriteAllText(Path.Combine(destination, stem + ".json"), System.Text.Json.JsonSerializer.Serialize(metadata, ProjectConfig.Context.AssetMetadata));
         }
     }
 }

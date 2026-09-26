@@ -1,27 +1,31 @@
 # LevelBuilder
 
-A focused 2D level editor for Aseprite assets, protobuf levels, and Go games. Built with C# and Avalonia for Linux and Windows.
+A compact desktop 2D level editor for Aseprite and PNG assets, protobuf projects, and Go games. Built with C# and Avalonia for Linux and Windows.
 
 ## Install
 
-Download the [latest release](https://github.com/isaiahpettingill/LevelBuilder/releases/latest), or run the platform installer:
+Download the [latest release](https://github.com/isaiahpettingill/LevelBuilder/releases/latest), or run the Linux installer:
 
 ```sh
 curl -fsSL https://github.com/isaiahpettingill/LevelBuilder/releases/latest/download/install.sh | sh
 ```
 
-On Windows PowerShell, download `install.ps1` from the release and run `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Both installers verify the release archive's SHA-256 checksum. The app checks for updates at startup and from **Check updates**; accepting an update downloads it and restarts the app.
+On Windows PowerShell, download `install.ps1` from the release and run `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Both installers verify the release ZIP's SHA-256 checksum. The app checks for updates at startup and from **Check updates**; accepting an update downloads it and restarts the app.
 
-## Develop
+Desktop release binaries use Native AOT, full trimming, size optimization, and stripped symbols. They do not need a .NET installation. Development requires the .NET 10 SDK; run `dotnet run --project src/LevelBuilder.App`. Linux Native AOT publishing additionally requires clang and zlib development headers. Run tests with `dotnet test tests/LevelBuilder.Core.Tests`.
 
-Install the .NET 10 SDK, then run `dotnet run --project src/LevelBuilder.App`. Build with `dotnet build src/LevelBuilder.App`. Tests: `dotnet test tests/LevelBuilder.Core.Tests`.
+## Project and file formats
 
-Create a project in the app. Its JSON defines `assetDirectory`, `levelDirectory`, `assets` (relative source paths mapped to `Tileset` or `AnimatedSprite`), `colliderTypes`, and `anchorTypes`. Import `.ase` / `.aseprite` files through the toolbar. A tileset's frame canvas dimensions must match the level tile size; frames in nonoverlapping tags are stable references such as `grass[2]`. Untagged frames appear with a warning and use unstable absolute references.
+Create a project in the app. A simple `project.json` describes asset directories and editable source files. The saved `.level` protobuf file is the portable project: it holds its own project settings, multiple named maps, strongly typed collider and anchor definitions, Aseprite/PNG source references, and **embedded PNG texture atlases with tags, frame timing, and directions**. A game can read one `.level` file to access its levels and decoded textures. It does not need the original Aseprite or PNG files. The editor refreshes the cache when a source changes and can keep working from the embedded cache if the source is missing.
 
-The editor writes `.level` protobuf files following `schemas/level.proto`. **Export** writes the level, runtime PNG atlases and JSON metadata, and `types.go` to the project's `build/` directory. The runtime reads protobuf and PNG; it does not need to parse Aseprite. Asset changes reload automatically and missing references are reported in the status bar and at save/export. `.recovery` files are saved beside edited levels every 30 seconds.
+A `.levelz` is a ZIP containing `levels/level.level`, the source files that are available, and the protobuf schema. Open, save, or share one from the toolbar. It can be opened even when an original source file has gone missing because the `.level` inside contains a texture cache. Project files written by version 0.1.0 (which contained a single bare level) are imported using the adjacent project configuration.
 
-Select a visual layer, palette tile, and tool to paint. Switch to collider mode to paint property cells. Select mode supports dragging sprites and anchors and selecting rectangular tile or collider regions. Middle drag pans; wheel zooms. Shortcuts: Ctrl+S save, Ctrl+Z/Y undo/redo, Ctrl+C/X/V copy/cut/paste, Ctrl+D duplicate, Delete remove, I picker, Tab toggle visual/collider, +/- zoom, arrow keys move objects or pan.
+Import `.ase`, `.aseprite`, or `.png` as a tileset or visual sprite. Aseprite tilesets treat each frame as a tile: nonoverlapping tags give stable tag-relative variants. PNG tilesets split the image into grid tiles using the active level's tile dimensions and assign the `tiles` tag. PNG sprites use one frame. Animated Aseprite sprites preserve their tag directions and frame timing. The editor indicates unstable, untagged Aseprite frames in the palette.
 
-## Current limitations
+**Export** writes `game.level`, PNG atlases and JSON metadata, and Go enum/query helpers (`types.go`) to the project's `build/` directory. The protobuf schema is in `schemas/level.proto` and copied into newly created projects. Go games can generate protobuf bindings from that schema and read `LevelDocument.CachedAssets[*].AtlasPng` without reading source asset files.
 
-The Aseprite reader composites normal RGBA/grayscale/indexed cels and reads tag directions, frame timing, and linked cels. Complex Aseprite blend modes and tilemap cels are not yet rendered. An animated sprite's tag can be previewed; reverse and ping-pong directions are supported. Runtime animation metadata preserves the original direction number. The editor supports one platform architecture per OS in release builds (`linux-x64`, `win-x64`).
+The canvas supports paint, erase, rectangle and flood fills, selection, undo and redo, visual layers, a collider grid, visual sprite objects, and typed entity anchors. Middle drag pans; wheel zooms. Shortcuts include Ctrl+S save, Ctrl+Z/Y undo/redo, Ctrl+C/X/V copy/cut/paste, Ctrl+D duplicate, Delete remove, I picker, Tab toggle visual/collider, +/- zoom, and arrow keys to move objects or pan. A `.recovery` copy is saved beside the current level project every 30 seconds while edited.
+
+## Current limits
+
+The Aseprite reader handles normal RGBA/grayscale/indexed cels, linked cels, tags, and frame timing. Advanced blend modes and Aseprite tilemap cels are not rendered. Released Windows and Linux targets are x64. The user interface is not a gameplay or physics simulator.

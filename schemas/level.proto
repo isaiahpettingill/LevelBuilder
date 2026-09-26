@@ -2,6 +2,33 @@ syntax = "proto3";
 package levelbuilder;
 option csharp_namespace = "LevelBuilder.Core.Format";
 
+// One project contains all maps and the types needed to interpret them.
+message LevelDocument {
+  uint32 format_version = 20;
+  ProjectSettings project = 21;
+  repeated Level levels = 22;
+  repeated CachedAsset cached_assets = 23;
+}
+message ProjectSettings {
+  uint32 schema_version = 1;
+  string asset_directory = 2;
+  string level_directory = 3;
+  repeated AssetSource assets = 4;
+  repeated string collider_types = 5;
+  repeated string anchor_types = 6;
+}
+message AssetSource { string path = 1; string kind = 2; }
+message CachedAsset {
+  string path = 1;
+  string kind = 2;
+  uint32 frame_width = 3;
+  uint32 frame_height = 4;
+  bytes atlas_png = 5;
+  repeated uint32 durations_ms = 6;
+  repeated FrameTag tags = 7;
+}
+message FrameTag { string name = 1; uint32 from = 2; uint32 to = 3; uint32 direction = 4; }
+
 message Level {
   uint32 format_version = 1;
   string name = 2;

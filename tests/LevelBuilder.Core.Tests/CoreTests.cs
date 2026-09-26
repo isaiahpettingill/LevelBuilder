@@ -2,6 +2,8 @@ using System.Text;
 using LevelBuilder.Core;
 using LevelBuilder.Core.Format;
 using Xunit;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
 
 namespace LevelBuilder.Core.Tests;
 
@@ -103,5 +105,41 @@ public class CoreTests
             }
         }
         finally { File.Delete(path); }
+    }
+    [Fact]
+    public void DocumentContainsMultipleLevelsAndCachedPngSurvivesMissingSource()
+    {
+        var root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        try
+        {
+            var projectPath = Path.Combine(root, "project.json"); var config = ProjectConfig.Create(projectPath);
+            var png = Path.Combine(root, "assets", "tiles.png");
+            using (var image = new Image<Rgba32>(2, 1))
+            {
+                image[0, 0] = new Rgba32(255, 0, 0); image[1, 0] = new Rgba32(0, 255, 0); image.SaveAsPng(png);
+            }
+            config.Assets["assets/tiles.png"] = AssetKind.Tileset;
+            var doc = LevelStore.NewDocument(config);
+            doc.Levels[0].Name = "Village";
+            doc.Levels.Add(LevelStore.New("Cave", 16, 16, 1, 1));
+            using (var asset = PngAssetReader.Read(png, AssetKind.Tileset, 1, 1))
+            {
+                Assert.Equal(1, asset.FrameFor("tiles", 1));
+                doc.CachedAssets.Add(AssetCache.Create("assets/tiles.png", AssetKind.Tileset, asset));
+            }
+            doc.Levels[1].VisualLayers[0].Tiles.Add(new TileCell { X = 1, Y = 2, Tile = new TileReference { Tileset = "assets/tiles.png", Tagged = new TaggedVariant { Tag = "tiles", Variant = 1 } } });
+            var path = Path.Combine(root, "levels", "game.level"); LevelStore.SaveDocument(doc, path);
+            var loaded = LevelStore.LoadDocument(path);
+            Assert.Equal(new[] { "Village", "Cave" }, loaded.Levels.Select(l => l.Name));
+            Assert.Equal(AssetKind.Tileset, ProjectConfig.FromSettings(loaded.Project).Assets["assets/tiles.png"]);
+            File.Delete(png);
+            using (var restored = AssetCache.Restore(loaded.CachedAssets[0])) Assert.Equal((byte)255, restored.Frames[1].Image[0, 0].G);
+            var bundle = Path.Combine(root, "game.levelz"); LevelBundle.Export(loaded, new ProjectContext(projectPath, config), bundle);
+            using var opened = LevelBundle.Open(bundle);
+            Assert.Equal(2, opened.Document.Levels.Count);
+            Assert.False(File.Exists(opened.Project.Resolve("assets/tiles.png")));
+            Assert.Single(opened.Document.CachedAssets);
+        }
+        finally { Directory.Delete(root, true); }
     }
 }
